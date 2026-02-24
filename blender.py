@@ -347,6 +347,25 @@ def _clean_code(code):
             out.append(line)
     return "\n".join(out)
 
+def _ensure_imports(code):
+    """Prepend standard imports so the saved text block is self-contained."""
+    if not code:
+        return code
+
+    header_lines = []
+    if "bpy" in code and "import bpy" not in code:
+        header_lines.append("import bpy")
+    if "bmesh" in code and "import bmesh" not in code:
+        header_lines.append("import bmesh")
+    if "mathutils" in code and "import mathutils" not in code:
+        header_lines.append("import mathutils")
+    if re.search(r'\bmath\.', code) and "import math" not in code:
+        header_lines.append("import math")
+
+    if header_lines:
+        return "\n".join(header_lines) + "\n\n" + code
+    return code
+
 def _get_text_block(name):
     """Get or create a Text datablock."""
     tb = bpy.data.texts.get(name)
@@ -1070,7 +1089,7 @@ class AIGEN_OT_Generate(bpy.types.Operator):
             # Update text block
             tb = _get_text_block(CODE_TEXT_NAME)
             tb.clear()
-            tb.write(code)
+            tb.write(_ensure_imports(code))
 
             lines = code.count("\n") + 1
             stmts = _S.executor.executed_count if _S.executor else 0
@@ -1094,11 +1113,10 @@ class AIGEN_OT_Generate(bpy.types.Operator):
         code = _clean_code(code)
         _S.current_code = code
 
+        # Write to text block WITHOUT line numbers
         tb = _get_text_block(CODE_TEXT_NAME)
         tb.clear()
-        # Write with line numbers
-        for i, line in enumerate(code.split("\n"), 1):
-            tb.write(f"{i:4d} │ {line}\n")
+        tb.write(_ensure_imports(code)) # Just the raw code, no formatting
 
         # Execute remaining statements
         if _S.executor:
@@ -1108,7 +1126,7 @@ class AIGEN_OT_Generate(bpy.types.Operator):
 
         if ok:
             label = ("🎉 Model created!" if _S.mode == "generating"
-                     else "🎉 Auto-fix worked!")
+                    else "🎉 Auto-fix worked!")
             props.status = label
             props.progress = (
                 f"✅ Done — {code.count(chr(10))+1} lines "
@@ -1135,7 +1153,7 @@ class AIGEN_OT_Generate(bpy.types.Operator):
                 _clear_scene()
                 self._start_fix_stream(context, code, msg)
                 # Stay modal — the fix stream reuses this timer
-                return
+                return True
             else:
                 props.status = "❌ Execution failed"
                 self._finalise(context)
