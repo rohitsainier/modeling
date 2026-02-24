@@ -666,7 +666,7 @@ class AIModelGeneratorDialog(QtWidgets.QDialog):
             QTextEdit {
                 font-family: monospace;
                 font-size: 11px;
-                background-color: #f5f5f5;
+                background-color: #1e1e1e;
                 padding: 5px;
                 border-radius: 4px;
             }
