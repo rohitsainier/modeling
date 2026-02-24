@@ -12,8 +12,8 @@ import uvicorn
 import json
 import logging
 
-from catia_bridge import get_bridge
-from ollama_generator import create_generator
+from cad_bridge import get_bridge
+from ollama_generator_mac import create_generator
 from code_executor import CodeExecutor
 
 app = FastAPI(title="CATIA 3D Model Generator")
@@ -40,7 +40,7 @@ async def startup():
     global bridge, generator, executor
     bridge = get_bridge()
     bridge.connect()
-    generator = create_generator("qwen2.5-coder:14b")
+    generator = create_generator("qwen3-coder:480b-cloud")
     executor = CodeExecutor(bridge)
     logger.info("Web UI initialized")
 
@@ -324,7 +324,11 @@ async def generate_model(request: ModelRequest):
         
         code = generator.generate_code(request.prompt)
         success, message, error = executor.execute(code)
-        
+
+        print(f"Generated code: {code}")
+        print(f"Success: {success}")
+        print(f"Message: {message}")
+        print(f"Error: {error}")
         result = {
             "success": success,
             "message": message,

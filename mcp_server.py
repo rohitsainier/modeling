@@ -12,8 +12,8 @@ import logging
 import json
 from typing import Optional
 
-from catia_bridge import CATIABridge, get_bridge
-from ollama_generator import OllamaGenerator, create_generator
+from cad_bridge import CADBridge, get_bridge
+from ollama_generator_mac import OllamaGenerator, create_generator
 from code_executor import CodeExecutor
 
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +41,7 @@ def ensure_initialized():
             raise RuntimeError("Cannot connect to CATIA. Is it running?")
     
     if generator is None:
-        generator = create_generator("qwen2.5-coder:14b")
+        generator = create_generator("qwen3-coder:480b-cloud")
     
     if executor is None:
         executor = CodeExecutor(bridge)

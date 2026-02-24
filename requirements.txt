@@ -1,4 +1,4 @@
-pywin32>=306
+#pywin32>=306 for windoes only
 ollama>=0.4.0
 mcp>=1.0.0
 fastapi>=0.115.0

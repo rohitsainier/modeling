@@ -1,0 +1,921 @@
+# -*- coding: utf-8 -*-
+# AI_ModelGenerator.FCMacro
+"""
+🏭 AI 3D Model Generator for FreeCAD
+=====================================
+Type a prompt → Get a 3D model instantly inside FreeCAD.
+
+Uses Ollama (local LLM) to generate FreeCAD Python code
+and executes it directly.
+
+Requirements:
+  - Ollama running locally (ollama serve)
+  - A coding model pulled (e.g., ollama pull qwen2.5-coder:14b)
+
+Usage:
+  1. Start Ollama: ollama serve
+  2. In FreeCAD: Macro → Macros → AI_ModelGenerator → Execute
+  3. Type your prompt in the dialog
+  4. Click Generate → model appears!
+
+Author: AI-Assisted CAD Generator
+"""
+
+# ═══════════════════════════════════════════════════
+# CONFIGURATION — Change these to match your setup
+# ═══════════════════════════════════════════════════
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+OLLAMA_MODEL = "qwen3-coder:480b-cloud"   # ← Change to your model
+
+# ═══════════════════════════════════════════════════
+# IMPORTS
+# ═══════════════════════════════════════════════════
+
+import FreeCAD
+import Part
+import json
+import re
+import traceback
+import builtins
+
+# Use urllib (built-in) so we don't need pip install anything
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+# Qt GUI imports (FreeCAD bundles these)
+try:
+    from PySide2 import QtCore, QtGui, QtWidgets
+except ImportError:
+    try:
+        from PySide6 import QtCore, QtGui, QtWidgets
+    except ImportError:
+        from PySide import QtCore, QtGui
+        QtWidgets = QtGui  # PySide1 fallback
+
+
+# ═══════════════════════════════════════════════════
+# SYSTEM PROMPT — Teaches the LLM FreeCAD's API
+# ═══════════════════════════════════════════════════
+
+SYSTEM_PROMPT = r"""You are an expert FreeCAD automation engineer. You write Python code that creates 3D models using FreeCAD's Python API.
+
+## CRITICAL RULES:
+1. Output ONLY a single Python code block. No explanations.
+2. Do NOT import FreeCAD or Part — already available.
+3. Do NOT create a document — `doc` already exists.
+4. Always call `doc.recompute()` at the very end.
+5. All measurements in millimeters (mm).
+6. Give every object a `.Label`.
+
+## AVAILABLE VARIABLES:
+- `FreeCAD` / `App` — FreeCAD module
+- `Part` — Part module
+- `doc` — active document
+- `Vector(x,y,z)` — FreeCAD.Vector
+- `Placement(pos, rot)` — FreeCAD.Placement
+- `Rotation(axis, angle)` — FreeCAD.Rotation
+
+## PATTERNS:
+
+### Box:
+```python
+box = doc.addObject("Part::Box", "MyBox")
+box.Length = 100.0; box.Width = 50.0; box.Height = 30.0
+box.Label = "Base Plate"
+doc.recompute()
+Cylinder:
+Python
+
+cyl = doc.addObject("Part::Cylinder", "MyCyl")
+cyl.Radius = 25.0; cyl.Height = 80.0
+cyl.Label = "Cylinder"
+cyl.Placement.Base = Vector(0, 0, 30)
+doc.recompute()
+Sphere:
+Python
+
+sphere = doc.addObject("Part::Sphere", "MySphere")
+sphere.Radius = 20.0
+sphere.Label = "Ball"
+doc.recompute()
+Cone:
+Python
+
+cone = doc.addObject("Part::Cone", "MyCone")
+cone.Radius1 = 30.0; cone.Radius2 = 10.0; cone.Height = 50.0
+cone.Label = "Cone"
+doc.recompute()
+Torus:
+Python
+
+torus = doc.addObject("Part::Torus", "MyTorus")
+torus.Radius1 = 40.0; torus.Radius2 = 10.0
+torus.Label = "Torus"
+doc.recompute()
+Boolean Fuse (Join):
+Python
+
+box = doc.addObject("Part::Box", "Box")
+box.Length = 100; box.Width = 50; box.Height = 20
+
+cyl = doc.addObject("Part::Cylinder", "Cyl")
+cyl.Radius = 15; cyl.Height = 40
+cyl.Placement.Base = Vector(50, 25, 0)
+
+fusion = doc.addObject("Part::Fuse", "Fused")
+fusion.Shape1 = box; fusion.Shape2 = cyl
+fusion.Label = "Combined"
+box.Visibility = False; cyl.Visibility = False
+doc.recompute()
+Boolean Cut (Hole):
+Python
+
+base = doc.addObject("Part::Box", "Base")
+base.Length = 100; base.Width = 100; base.Height = 20
+
+hole = doc.addObject("Part::Cylinder", "Hole")
+hole.Radius = 15; hole.Height = 30
+hole.Placement.Base = Vector(50, 50, -5)
+
+cut = doc.addObject("Part::Cut", "WithHole")
+cut.Base = base; cut.Tool = hole
+cut.Label = "Plate With Hole"
+base.Visibility = False; hole.Visibility = False
+doc.recompute()
+Multiple Holes (Loop):
+Python
+
+plate = doc.addObject("Part::Box", "Plate")
+plate.Length = 200; plate.Width = 100; plate.Height = 10
+
+result = plate
+positions = [(15,15), (185,15), (185,85), (15,85)]
+
+for i, (x, y) in enumerate(positions):
+    h = doc.addObject("Part::Cylinder", f"H_{i}")
+    h.Radius = 5.0; h.Height = 20.0
+    h.Placement.Base = Vector(x, y, -5)
+    c = doc.addObject("Part::Cut", f"C_{i}")
+    c.Base = result; c.Tool = h
+    result.Visibility = False; h.Visibility = False
+    result = c
+
+result.Label = "Plate With Holes"
+doc.recompute()
+Extrude from Wire:
+Python
+
+points = [Vector(0,0,0), Vector(50,0,0), Vector(50,30,0),
+          Vector(25,50,0), Vector(0,30,0), Vector(0,0,0)]
+wire = Part.makePolygon(points)
+face = Part.Face(wire)
+solid = face.extrude(Vector(0, 0, 20))
+obj = doc.addObject("Part::Feature", "Extruded")
+obj.Shape = solid; obj.Label = "Custom Shape"
+doc.recompute()
+Revolve:
+Python
+
+points = [Vector(10,0,0), Vector(30,0,0), Vector(30,0,50),
+          Vector(10,0,50), Vector(10,0,0)]
+wire = Part.makePolygon(points)
+face = Part.Face(wire)
+solid = face.revolve(Vector(0,0,0), Vector(0,0,1), 360)
+obj = doc.addObject("Part::Feature", "Revolved")
+obj.Shape = solid; obj.Label = "Revolved Body"
+doc.recompute()
+Fillet:
+Python
+
+box_shape = Part.makeBox(50, 50, 50)
+fillet = box_shape.makeFillet(3.0, box_shape.Edges)
+obj = doc.addObject("Part::Feature", "Filleted")
+obj.Shape = fillet; obj.Label = "Rounded Box"
+doc.recompute()
+Chamfer:
+Python
+
+box_shape = Part.makeBox(50, 50, 50)
+chamfer = box_shape.makeChamfer(2.0, box_shape.Edges)
+obj = doc.addObject("Part::Feature", "Chamfered")
+obj.Shape = chamfer; obj.Label = "Chamfered Box"
+doc.recompute()
+Positioning:
+Python
+
+cyl = doc.addObject("Part::Cylinder", "Cyl")
+cyl.Radius = 10; cyl.Height = 50
+# Rotate 90° around X (horizontal cylinder)
+cyl.Placement = Placement(Vector(100,50,0), Rotation(Vector(1,0,0), 90))
+doc.recompute()
+RULES:
+doc.addObject("Part::Box", "name") for parametric primitives
+Boolean Cut: .Base and .Tool
+Boolean Fuse: .Shape1 and .Shape2
+Hide intermediates: obj.Visibility = False
+Close wire loops for extrusion
+doc.recompute() MUST be the last call
+Output ONLY code. No text before or after.
+"""
+
+# ═══════════════════════════════════════════════════
+# OLLAMA API CLIENT (uses urllib — no pip needed)
+# ═══════════════════════════════════════════════════
+
+
+class OllamaClient:
+    """Calls Ollama REST API using built-in urllib."""
+
+    def __init__(self, base_url=OLLAMA_URL, model=OLLAMA_MODEL):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.history = []
+
+    def is_running(self):
+        """Check if Ollama is reachable."""
+        try:
+            req = Request(f"{self.base_url}/api/tags")
+            resp = urlopen(req, timeout=3)
+            return getattr(resp, "status", 200) == 200
+        except Exception:
+            return False
+
+    def get_models(self):
+        """List available models."""
+        try:
+            req = Request(f"{self.base_url}/api/tags")
+            resp = urlopen(req, timeout=5)
+            data = json.loads(resp.read().decode())
+            return [m.get("name", m.get("model", "")) for m in data.get("models", [])]
+        except Exception:
+            return []
+
+    def generate(self, prompt, add_to_history=True):
+        """
+        Send prompt to Ollama and return generated code.
+        Uses the REST API directly — no pip packages needed.
+        """
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(self.history)
+        messages.append({
+            "role": "user",
+            "content": (
+                "Generate FreeCAD Python code for:\n\n"
+                f"{prompt}\n\n"
+                "Output ONLY Python code. No explanations."
+            ),
+        })
+
+        payload = json.dumps({
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": 0.15,
+                "top_p": 0.9,
+                "num_predict": 4096,
+            },
+        }).encode("utf-8")
+
+        req = Request(
+            f"{self.base_url}/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        resp = urlopen(req, timeout=120)
+        result = json.loads(resp.read().decode())
+
+        raw_text = result.get("message", {}).get("content", "")
+
+        # Extract code
+        code = self._extract_code(raw_text)
+        code = self._clean_code(code)
+
+        # Save history
+        if add_to_history:
+            self.history.append({"role": "user", "content": prompt})
+            self.history.append({"role": "assistant", "content": raw_text})
+            # Keep last 10 exchanges
+            if len(self.history) > 20:
+                self.history = self.history[-20:]
+
+        return code, raw_text
+
+    def fix_code(self, code, error):
+        """Ask LLM to fix broken code."""
+        fix_prompt = (
+            "This FreeCAD code has an error. Fix it completely.\n\n"
+            f"CODE:\n```python\n{code}\n```\n\n"
+            f"ERROR:\n```\n{error}\n```\n\n"
+            "Return ONLY the fixed Python code."
+        )
+        return self.generate(fix_prompt, add_to_history=False)
+
+    def clear_history(self):
+        self.history.clear()
+
+    def _extract_code(self, text):
+        """Extract Python from markdown fences."""
+        if not text:
+            return "doc.recompute()"
+
+        # ```python ... ```
+        m = re.findall(r"```python\s*\n(.*?)```", text, re.DOTALL)
+        if m:
+            return "\n\n".join(x.strip() for x in m)
+
+        # ``` ... ```
+        m = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
+        if m:
+            return "\n\n".join(x.strip() for x in m)
+
+        # No fences — return as-is
+        return text.strip()
+
+    def _clean_code(self, code):
+        """Remove lines that conflict with our setup."""
+        lines = code.split("\n")
+        cleaned = []
+        skip_markers = [
+            "import freecad",
+            "import part",
+            "from freecad",
+            "sys.path",
+            "app.newdocument",
+            "freecad.newdocument",
+            "doc = app",
+            "doc = freecad",
+            "doc=app",
+            "document = app",
+        ]
+        for line in lines:
+            low = line.strip().lower()
+            if any(s in low for s in skip_markers):
+                cleaned.append(f"# [auto-removed]: {line}")
+            else:
+                cleaned.append(line)
+        return "\n".join(cleaned)
+
+
+# ═══════════════════════════════════════════════════
+# CODE EXECUTOR
+# ═══════════════════════════════════════════════════
+
+
+def execute_code(code, doc):
+    """
+    Execute generated code inside FreeCAD.
+    Returns (success, message).
+    """
+    # Build namespace
+    namespace = {
+        "FreeCAD": FreeCAD,
+        "App": FreeCAD,
+        "Part": Part,
+        "doc": doc,
+        "document": doc,
+        "Vector": FreeCAD.Vector,
+        "Placement": FreeCAD.Placement,
+        "Rotation": FreeCAD.Rotation,
+        # Safe builtins
+        "range": range,
+        "len": len,
+        "enumerate": enumerate,
+        "zip": zip,
+        "map": map,
+        "filter": filter,
+        "int": int,
+        "float": float,
+        "str": str,
+        "bool": bool,
+        "list": list,
+        "dict": dict,
+        "tuple": tuple,
+        "set": set,
+        "abs": abs,
+        "round": round,
+        "min": min,
+        "max": max,
+        "sum": sum,
+        "pow": pow,
+        "print": FreeCAD.Console.PrintMessage,
+        "sorted": sorted,
+        "reversed": reversed,
+        "any": any,
+        "all": all,
+        "isinstance": isinstance,
+        "hasattr": hasattr,
+        "getattr": getattr,
+        "True": True,
+        "False": False,
+        "None": None,
+        "builtins": builtins,
+    }
+
+    try:
+        import math
+
+        namespace["math"] = math
+    except ImportError:
+        pass
+
+    try:
+        exec(code, namespace)
+        return True, "Model created successfully!"
+    except Exception as e:
+        tb = traceback.format_exc()
+        # Find the line that failed
+        line_match = re.search(r'File ["\']<string>["\'], line (\d+)', tb)
+        if line_match:
+            lineno = int(line_match.group(1))
+            lines = code.split("\n")
+            if 1 <= lineno <= len(lines):
+                return (
+                    False,
+                    f"{type(e).__name__}: {e}\n\nLine {lineno}: {lines[lineno-1].strip()}",
+                )
+        return False, f"{type(e).__name__}: {e}\n\n{tb}"
+
+
+# ═══════════════════════════════════════════════════
+# GUI DIALOG
+# ═══════════════════════════════════════════════════
+
+
+class AIModelGeneratorDialog(QtWidgets.QDialog):
+    """Main dialog window for the AI Model Generator."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ollama = OllamaClient()
+        self.last_code = ""
+        self.generation_count = 0
+        self._setup_ui()
+        self._check_ollama()
+
+    def _setup_ui(self):
+        """Build the UI."""
+        self.setWindowTitle("🏭 AI 3D Model Generator")
+        self.setMinimumSize(700, 600)
+        self.resize(800, 700)
+
+        # Main layout
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # ── Header ──
+        header = QtWidgets.QLabel(
+            "🏭 AI 3D Model Generator\n"
+            "Describe a 3D model → Ollama generates it → appears in FreeCAD"
+        )
+        header.setAlignment(QtCore.Qt.AlignCenter)
+        header.setStyleSheet(
+            """
+            QLabel {
+                font-size: 16px;
+                font-weight: bold;
+                padding: 10px;
+                color: #2196F3;
+            }
+            """
+        )
+        layout.addWidget(header)
+
+        # ── Status bar ──
+        self.status_label = QtWidgets.QLabel("Checking Ollama...")
+        self.status_label.setStyleSheet(
+            """
+            QLabel {
+                padding: 5px 10px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            """
+        )
+        layout.addWidget(self.status_label)
+
+        # ── Model selector ──
+        model_layout = QtWidgets.QHBoxLayout()
+        model_layout.addWidget(QtWidgets.QLabel("Model:"))
+        self.model_combo = QtWidgets.QComboBox()
+        self.model_combo.setMinimumWidth(250)
+        self.model_combo.setEditable(True)
+        self.model_combo.addItem(OLLAMA_MODEL)
+        model_layout.addWidget(self.model_combo)
+
+        refresh_btn = QtWidgets.QPushButton("🔄 Refresh")
+        refresh_btn.clicked.connect(self._refresh_models)
+        model_layout.addWidget(refresh_btn)
+        model_layout.addStretch()
+        layout.addLayout(model_layout)
+
+        # ── Prompt input ──
+        prompt_label = QtWidgets.QLabel("Describe your 3D model:")
+        prompt_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        layout.addWidget(prompt_label)
+
+        self.prompt_input = QtWidgets.QTextEdit()
+        self.prompt_input.setPlaceholderText(
+            "Examples:\n"
+            "• Create a cube with 50mm sides\n"
+            "• Make a plate 200x100x10mm with 4 corner holes of 8mm diameter\n"
+            "• Build a hollow cylinder OD=60mm ID=50mm length=100mm\n"
+            "• Create an L-bracket with 5mm fillets\n"
+            "• Make a simple gear shape with 8 teeth"
+        )
+        self.prompt_input.setMaximumHeight(120)
+        self.prompt_input.setStyleSheet(
+            """
+            QTextEdit {
+                font-size: 13px;
+                padding: 8px;
+                border: 2px solid #ccc;
+                border-radius: 6px;
+            }
+            QTextEdit:focus {
+                border-color: #2196F3;
+            }
+            """
+        )
+        layout.addWidget(self.prompt_input)
+
+        # ── Quick prompts ──
+        quick_layout = QtWidgets.QHBoxLayout()
+        quick_prompts = [
+            ("📦 Cube", "Create a cube with 50mm sides"),
+            ("🔵 Cylinder", "Create a cylinder radius 25mm height 80mm"),
+            ("🕳️ Plate+Holes", "Create a plate 200x100x10mm with 4 corner holes of 8mm"),
+            ("📐 L-Bracket", "Create an L-bracket 100x80x10mm with 5mm fillets"),
+        ]
+        for label, prompt in quick_prompts:
+            btn = QtWidgets.QPushButton(label)
+            btn.setMaximumHeight(30)
+            btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+            btn.clicked.connect(
+                lambda checked=False, p=prompt: self.prompt_input.setPlainText(p)
+            )
+            quick_layout.addWidget(btn)
+        layout.addLayout(quick_layout)
+
+        # ── Action buttons ──
+        btn_layout = QtWidgets.QHBoxLayout()
+
+        self.generate_btn = QtWidgets.QPushButton("🚀 Generate Model")
+        self.generate_btn.setMinimumHeight(45)
+        self.generate_btn.setStyleSheet(
+            """
+            QPushButton {
+                font-size: 15px;
+                font-weight: bold;
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 20px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #0D47A1;
+            }
+            QPushButton:disabled {
+                background-color: #90CAF9;
+            }
+            """
+        )
+        self.generate_btn.clicked.connect(self._on_generate)
+        btn_layout.addWidget(self.generate_btn)
+
+        self.modify_btn = QtWidgets.QPushButton("➕ Add Feature")
+        self.modify_btn.setMinimumHeight(45)
+        self.modify_btn.setStyleSheet(
+            """
+            QPushButton {
+                font-size: 13px;
+                font-weight: bold;
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 15px;
+            }
+            QPushButton:hover { background-color: #388E3C; }
+            QPushButton:disabled { background-color: #A5D6A7; }
+            """
+        )
+        self.modify_btn.clicked.connect(self._on_modify)
+        btn_layout.addWidget(self.modify_btn)
+
+        layout.addLayout(btn_layout)
+
+        # ── Second row buttons ──
+        btn_layout2 = QtWidgets.QHBoxLayout()
+
+        new_doc_btn = QtWidgets.QPushButton("📄 New Document")
+        new_doc_btn.clicked.connect(self._new_document)
+        btn_layout2.addWidget(new_doc_btn)
+
+        clear_btn = QtWidgets.QPushButton("🗑️ Clear History")
+        clear_btn.clicked.connect(self._clear_history)
+        btn_layout2.addWidget(clear_btn)
+
+        autofix_label = QtWidgets.QLabel("Auto-fix:")
+        btn_layout2.addWidget(autofix_label)
+        self.autofix_check = QtWidgets.QCheckBox()
+        self.autofix_check.setChecked(True)
+        btn_layout2.addWidget(self.autofix_check)
+
+        btn_layout2.addStretch()
+        layout.addLayout(btn_layout2)
+
+        # ── Code output ──
+        code_label = QtWidgets.QLabel("Generated Code:")
+        code_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        layout.addWidget(code_label)
+
+        self.code_output = QtWidgets.QTextEdit()
+        self.code_output.setReadOnly(True)
+        self.code_output.setStyleSheet(
+            """
+            QTextEdit {
+                font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+                font-size: 12px;
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                padding: 10px;
+                border-radius: 6px;
+            }
+            """
+        )
+        layout.addWidget(self.code_output)
+
+        # ── Log output ──
+        log_label = QtWidgets.QLabel("Log:")
+        log_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(log_label)
+
+        self.log_output = QtWidgets.QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setMaximumHeight(100)
+        self.log_output.setStyleSheet(
+            """
+            QTextEdit {
+                font-family: monospace;
+                font-size: 11px;
+                background-color: #f5f5f5;
+                padding: 5px;
+                border-radius: 4px;
+            }
+            """
+        )
+        layout.addWidget(self.log_output)
+
+        # ── Keyboard shortcut ── (Ctrl+Enter to generate)
+        shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self)
+        shortcut.activated.connect(self._on_generate)
+
+    # ──────────────────────────────────────
+    # Ollama Connection
+    # ──────────────────────────────────────
+
+    def _check_ollama(self):
+        """Check if Ollama is running."""
+        if self.ollama.is_running():
+            self._set_status("✅ Ollama connected", "green")
+            self._refresh_models()
+        else:
+            self._set_status(
+                "❌ Ollama not running — start it: ollama serve",
+                "red",
+            )
+            self.generate_btn.setEnabled(False)
+            self.modify_btn.setEnabled(False)
+
+    def _refresh_models(self):
+        """Refresh available models list."""
+        models = self.ollama.get_models()
+        current = self.model_combo.currentText()
+
+        self.model_combo.clear()
+        if models:
+            self.model_combo.addItems(models)
+            # Re-select current if still available
+            idx = self.model_combo.findText(current)
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+            self._log(f"Found {len(models)} models: {', '.join(models)}")
+        else:
+            self.model_combo.addItem(OLLAMA_MODEL)
+            self._log("Could not fetch models, using default")
+
+    def _set_status(self, text, color="black"):
+        """Update status label."""
+        colors = {
+            "green": "#E8F5E9",
+            "red": "#FFEBEE",
+            "blue": "#E3F2FD",
+            "orange": "#FFF3E0",
+            "black": "#F5F5F5",
+        }
+        text_colors = {
+            "green": "#2E7D32",
+            "red": "#C62828",
+            "blue": "#1565C0",
+            "orange": "#E65100",
+            "black": "#333",
+        }
+        bg = colors.get(color, colors["black"])
+        fg = text_colors.get(color, text_colors["black"])
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(
+            "padding: 5px 10px; border-radius: 4px; "
+            f"font-weight: bold; background-color: {bg}; color: {fg};"
+        )
+
+    def _log(self, message):
+        """Add message to log."""
+        self.log_output.append(message)
+        # Auto-scroll to bottom
+        scrollbar = self.log_output.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        # Also print to FreeCAD console
+        FreeCAD.Console.PrintMessage(f"[AI-Gen] {message}\n")
+
+    # ──────────────────────────────────────
+    # Document Management
+    # ──────────────────────────────────────
+
+    def _ensure_document(self):
+        """Make sure a document exists."""
+        if FreeCAD.ActiveDocument is None:
+            self.generation_count += 1
+            name = f"AI_Model_{self.generation_count}"
+            FreeCAD.newDocument(name)
+            self._log(f"Created new document: {name}")
+        return FreeCAD.ActiveDocument
+
+    def _new_document(self):
+        """Create a fresh document."""
+        self.generation_count += 1
+        name = f"AI_Model_{self.generation_count}"
+        FreeCAD.newDocument(name)
+        self._log(f"Created new document: {name}")
+        self._set_status(f"📄 New document: {name}", "blue")
+
+    # ──────────────────────────────────────
+    # Code Generation & Execution
+    # ──────────────────────────────────────
+
+    def _on_generate(self):
+        """Generate a NEW model from the prompt."""
+        prompt = self.prompt_input.toPlainText().strip()
+        if not prompt:
+            self._set_status("⚠️ Enter a description first!", "orange")
+            return
+
+        # Update model selection
+        self.ollama.model = self.model_combo.currentText()
+
+        # Create fresh document
+        self._new_document()
+        doc = FreeCAD.ActiveDocument
+
+        # Generate and execute
+        self._generate_and_execute(prompt, doc)
+
+    def _on_modify(self):
+        """Add a feature to the EXISTING model."""
+        prompt = self.prompt_input.toPlainText().strip()
+        if not prompt:
+            self._set_status("⚠️ Enter a description first!", "orange")
+            return
+
+        self.ollama.model = self.model_combo.currentText()
+
+        doc = self._ensure_document()
+
+        # Add context that document already exists
+        enhanced = (
+            "The document already has objects. "
+            "Do NOT recreate existing shapes. Only add:\n"
+            f"{prompt}"
+        )
+        self._generate_and_execute(enhanced, doc)
+
+    def _generate_and_execute(self, prompt, doc):
+        """Core: generate code, execute, handle errors."""
+        self.generate_btn.setEnabled(False)
+        self.modify_btn.setEnabled(False)
+        self._set_status("🤖 Generating code with Ollama...", "blue")
+        self.code_output.clear()
+
+        # Force UI update
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            # ── Generate ──
+            self._log(f"Prompt: {prompt[:80]}...")
+            code, raw = self.ollama.generate(prompt)
+            self.last_code = code
+
+            # Show code
+            self._display_code(code)
+            self._log(
+                f"Generated: {len(code)} chars, {code.count(chr(10)) + 1} lines"
+            )
+
+            # ── Execute ──
+            self._set_status("▶️ Executing code...", "blue")
+            QtWidgets.QApplication.processEvents()
+
+            success, message = execute_code(code, doc)
+
+            if success:
+                self._set_status("🎉 Model created successfully!", "green")
+                self._log(f"✅ {message}")
+                self._fit_view()
+            else:
+                self._set_status("❌ Execution error", "red")
+                self._log(f"❌ {message}")
+
+                # ── Auto-fix ──
+                if self.autofix_check.isChecked():
+                    self._log("🔄 Attempting auto-fix...")
+                    self._set_status("🔄 Auto-fixing code...", "orange")
+                    QtWidgets.QApplication.processEvents()
+
+                    try:
+                        fixed_code, _ = self.ollama.fix_code(code, message)
+                        self._display_code(fixed_code)
+                        self.last_code = fixed_code
+
+                        success2, message2 = execute_code(fixed_code, doc)
+                        if success2:
+                            self._set_status("🎉 Auto-fix successful!", "green")
+                            self._log(f"✅ Fixed: {message2}")
+                            self._fit_view()
+                        else:
+                            self._set_status("❌ Auto-fix also failed", "red")
+                            self._log(f"❌ Fix failed: {message2}")
+                    except Exception as fix_err:
+                        self._log(f"❌ Auto-fix error: {fix_err}")
+
+        except URLError as e:
+            self._set_status("❌ Cannot reach Ollama", "red")
+            self._log(f"Connection error: {e}")
+            self._log("Make sure Ollama is running: ollama serve")
+
+        except Exception as e:
+            self._set_status(f"❌ Error: {e}", "red")
+            self._log(f"Error: {traceback.format_exc()}")
+
+        finally:
+            self.generate_btn.setEnabled(True)
+            self.modify_btn.setEnabled(True)
+
+    def _display_code(self, code):
+        """Display code with line numbers in the output area."""
+        numbered = []
+        for i, line in enumerate(code.split("\n"), 1):
+            numbered.append(f"{i:3d} │ {line}")
+        self.code_output.setPlainText("\n".join(numbered))
+
+    def _fit_view(self):
+        """Fit the view to show the entire model."""
+        try:
+            import FreeCADGui
+
+            if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
+                FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                FreeCADGui.SendMsgToActiveView("ViewFit")
+        except Exception:
+            pass
+
+    def _clear_history(self):
+        """Clear conversation history."""
+        self.ollama.clear_history()
+        self._log("🗑️ History cleared")
+        self._set_status("History cleared", "blue")
+
+
+# ═══════════════════════════════════════════════════
+# LAUNCH
+# ═══════════════════════════════════════════════════
+
+
+def launch():
+    """Launch the AI Model Generator dialog."""
+    # Check if dialog already exists
+    app = QtWidgets.QApplication.instance()
+    # Just create a new dialog each time; FreeCAD will manage lifetime
+    parent = FreeCAD.Gui.getMainWindow() if hasattr(FreeCAD, "Gui") else None
+    dialog = AIModelGeneratorDialog(parent=parent)
+    dialog.show()
+    return dialog
+
+
+_dialog = launch()
