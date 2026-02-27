@@ -2,27 +2,40 @@
 # -*- coding: utf-8 -*-
 
 """
-AI_ModelGenerator.FCMacro
-Simple AI 3D Model Generator for FreeCAD using Ollama.
+FreeCAD MCP Server Addon
+========================
+Runs a TCP socket server inside FreeCAD that accepts JSON
+commands from an external MCP bridge process.
+
+Install:
+  1. Copy this file to FreeCAD's Macro folder
+     (Macro → Macros → "User macros location")
+  2. Macro → Execute Macro → FreeCADMCP.FCMacro
+  3. Click "Start Server"
+  4. Run freecad_mcp_server.py externally
 """
 
-# CONFIGURATION
+# ── Configuration ──────────────────────────────────
+DEFAULT_PORT = 9876
 
-OLLAMA_URL = "http://127.0.0.1:11434"
-OLLAMA_MODEL = "qwen3-coder:480b-cloud"
-
-
-# IMPORTS
-
+# ── Imports ────────────────────────────────────────
 import FreeCAD
 import Part
 import json
-import re
+import socket
 import traceback
+import math
+import os
 import builtins
+import re
+import tempfile
 
-from urllib.request import Request, urlopen
-from urllib.error import URLError
+try:
+    import FreeCADGui
+    HAS_GUI = True
+except ImportError:
+    FreeCADGui = None
+    HAS_GUI = False
 
 try:
     from PySide2 import QtCore, QtGui, QtWidgets
@@ -34,1249 +47,687 @@ except ImportError:
         QtWidgets = QtGui
 
 
-# SYSTEM PROMPT
+# ═══════════════════════════════════════════════════
+# MCP SOCKET SERVER
+# ═══════════════════════════════════════════════════
 
-SYSTEM_PROMPT = r"""You are an expert FreeCAD automation engineer. You write Python code that creates 3D models using FreeCAD's Python API.
-
-Rules:
-- Output ONLY a single Python code block. No explanations.
-- Do NOT import FreeCAD or Part — already available.
-- Do NOT create a document — `doc` already exists.
-- Always call `doc.recompute()` at the very end.
-- All measurements in millimeters (mm).
-- Give every object a `.Label`.
-
-Available:
-- FreeCAD / App
-- Part
-- doc (active document)
-- Vector, Placement, Rotation
-"""
-
-
-class OllamaClient:
-    """Minimal Ollama client using urllib (no extra deps)."""
-
-    def __init__(self, base_url=OLLAMA_URL, model=OLLAMA_MODEL):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.history = []
-
-    def is_running(self):
-        try:
-            req = Request(f"{self.base_url}/api/tags")
-            urlopen(req, timeout=3)
-            return True
-        except Exception:
-            return False
-
-    def get_models(self):
-        try:
-            req = Request(f"{self.base_url}/api/tags")
-            resp = urlopen(req, timeout=5)
-            data = json.loads(resp.read().decode())
-            return [m.get("name", m.get("model", "")) for m in data.get("models", [])]
-        except Exception:
-            return []
-
-    def _chat(self, messages):
-        payload = json.dumps(
-            {
-                "model": self.model,
-                "messages": messages,
-                "stream": False,
-                "options": {
-                    "temperature": 0.15,
-                    "top_p": 0.9,
-                    "num_predict": 4096,
-                },
-            }
-        ).encode("utf-8")
-
-        req = Request(
-            f"{self.base_url}/api/chat",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        resp = urlopen(req, timeout=300)
-        result = json.loads(resp.read().decode())
-        return result.get("message", {}).get("content", "")
-
-    def generate(self, prompt, add_to_history=True):
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend(self.history)
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Generate FreeCAD Python code for:\n\n"
-                    f"{prompt}\n\n"
-                    "Output ONLY Python code. No explanations."
-                ),
-            }
-        )
-
-        raw_text = self._chat(messages)
-        code = self._extract_code(raw_text)
-        code = self._clean_code(code)
-
-        if add_to_history:
-            self.history.append({"role": "user", "content": prompt})
-            self.history.append({"role": "assistant", "content": raw_text})
-            if len(self.history) > 20:
-                self.history = self.history[-20:]
-
-        return code, raw_text
-
-    def fix_code(self, code, error):
-        fix_prompt = (
-            "This FreeCAD code produced an error. Fix it completely.\n\n"
-            f"CODE:\n```python\n{code}\n```\n\n"
-            f"ERROR:\n```\n{error}\n```\n\n"
-            "Return ONLY the fixed Python code."
-        )
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.append({"role": "user", "content": fix_prompt})
-        raw_text = self._chat(messages)
-        code = self._extract_code(raw_text)
-        code = self._clean_code(code)
-        return code, raw_text
-
-    def clear_history(self):
-        self.history.clear()
-
-    @staticmethod
-    def _extract_code(text):
-        if not text:
-            return "doc.recompute()"
-
-        m = re.findall(r"```python\s*\n(.*?)```", text, re.DOTALL)
-        if m:
-            return "\n\n".join(x.strip() for x in m)
-
-        m = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
-        if m:
-            return "\n\n".join(x.strip() for x in m)
-
-        return text.strip()
-
-    @staticmethod
-    def _clean_code(code):
-        if not code:
-            return code
-
-        skip_markers = [
-            "import freecad",
-            "import part",
-            "from freecad",
-            "sys.path",
-            "app.newdocument",
-            "freecad.newdocument",
-            "doc = app",
-            "doc = freecad",
-            "doc=app",
-            "document = app",
-        ]
-        cleaned = []
-        for line in code.split("\n"):
-            low = line.strip().lower()
-            if any(s in low for s in skip_markers):
-                cleaned.append(f"# [auto-removed]: {line}")
-            else:
-                cleaned.append(line)
-        return "\n".join(cleaned)
-
-
-def execute_code(code, doc):
+class FreeCADMCPServer:
     """
-    Execute generated code inside FreeCAD.
-    Returns (success: bool, message: str).
+    Non-blocking TCP server that runs inside FreeCAD.
+    Accepts JSON commands and executes them in the FreeCAD context.
+    Uses QTimer so the GUI stays responsive.
     """
-    ns = {
-        "FreeCAD": FreeCAD,
-        "App": FreeCAD,
-        "Part": Part,
-        "doc": doc,
-        "document": doc,
-        "Vector": FreeCAD.Vector,
-        "Placement": FreeCAD.Placement,
-        "Rotation": FreeCAD.Rotation,
-        "range": range,
-        "len": len,
-        "enumerate": enumerate,
-        "zip": zip,
-        "map": map,
-        "filter": filter,
-        "int": int,
-        "float": float,
-        "str": str,
-        "bool": bool,
-        "list": list,
-        "dict": dict,
-        "tuple": tuple,
-        "set": set,
-        "abs": abs,
-        "round": round,
-        "min": min,
-        "max": max,
-        "sum": sum,
-        "pow": pow,
-        "print": FreeCAD.Console.PrintMessage,
-        "sorted": sorted,
-        "reversed": reversed,
-        "any": any,
-        "all": all,
-        "isinstance": isinstance,
-        "hasattr": hasattr,
-        "getattr": getattr,
-        "True": True,
-        "False": False,
-        "None": None,
-        "builtins": builtins,
-    }
 
-    try:
-        import math
+    def __init__(self, host="localhost", port=DEFAULT_PORT):
+        self.host = host
+        self.port = port
+        self.running = False
+        self.server_socket = None
+        self.client_socket = None
+        self.buffer = b""
+        self.timer = None
 
-        ns["math"] = math
-    except Exception:
-        pass
+    # ── Lifecycle ──────────────────────────────
 
-    try:
-        exec(code, ns)
-        return True, "Model created successfully!"
-    except Exception as e:
-        tb = traceback.format_exc()
-        m = re.search(r'File ["\']<string>["\'], line (\d+)', tb)
-        if m:
-            lineno = int(m.group(1))
-            lines = code.split("\n")
-            if 1 <= lineno <= len(lines):
-                return (
-                    False,
-                    f"{type(e).__name__}: {e}\n\n"
-                    f"Line {lineno}: {lines[lineno - 1].strip()}",
-                )
-        return False, f"{type(e).__name__}: {e}\n\n{tb}"
-
-
-class AIModelGeneratorDialog(QtWidgets.QDialog):
-    """Main dialog window for the AI 3D Model Generator."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.ollama = OllamaClient()
-        self.last_code = ""
-        self.generation_count = 0
-        self._setup_ui()
-        self._check_ollama()
-
-    def _setup_ui(self):
-        self.setWindowTitle("AI 3D Model Generator")
-        self.setMinimumSize(700, 600)
-
-        root = QtWidgets.QVBoxLayout(self)
-        root.setSpacing(8)
-
-        header = QtWidgets.QLabel(
-            "AI 3D Model Generator\n"
-            "Describe a 3D model → Ollama generates it → appears in FreeCAD"
-        )
-        header.setAlignment(QtCore.Qt.AlignCenter)
-        header.setStyleSheet(
-            "font-size:16px; font-weight:bold; padding:10px; color:#2196F3;"
-        )
-        root.addWidget(header)
-
-        self.status_label = QtWidgets.QLabel("Checking Ollama…")
-        self.status_label.setStyleSheet(
-            "padding:5px 10px; border-radius:4px; font-weight:bold;"
-        )
-        root.addWidget(self.status_label)
-
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Model:"))
-        self.model_combo = QtWidgets.QComboBox()
-        self.model_combo.setEditable(True)
-        self.model_combo.setMinimumWidth(260)
-        self.model_combo.addItem(OLLAMA_MODEL)
-        row.addWidget(self.model_combo)
-        refresh_btn = QtWidgets.QPushButton("Refresh")
-        refresh_btn.clicked.connect(self._refresh_models)
-        row.addWidget(refresh_btn)
-        row.addStretch()
-        root.addLayout(row)
-
-        prompt_label = QtWidgets.QLabel("Describe your 3D model:")
-        prompt_label.setStyleSheet("font-weight:bold; font-size:13px;")
-        root.addWidget(prompt_label)
-
-        self.prompt_input = QtWidgets.QTextEdit()
-        self.prompt_input.setPlaceholderText(
-            "Examples:\n"
-            "• Create a cube with 50mm sides\n"
-            "• Plate 200x100x10mm with 4 corner holes of 8mm diameter\n"
-            "• Hollow cylinder OD=60mm ID=50mm length=100mm\n"
-            "• L-bracket 100x80x10mm with 5mm fillets"
-        )
-        self.prompt_input.setMaximumHeight(120)
-        self.prompt_input.setStyleSheet(
-            "QTextEdit{font-size:13px; padding:8px; border:2px solid #ccc; "
-            "border-radius:6px;} QTextEdit:focus{border-color:#2196F3;}"
-        )
-        root.addWidget(self.prompt_input)
-
-        quick_row = QtWidgets.QHBoxLayout()
-        for label, text in [
-            ("Cube", "Create a cube with 50mm sides"),
-            ("Cylinder", "Create a cylinder radius 25mm height 80mm"),
-            ("Plate+Holes", "Plate 200x100x10mm with 4 corner holes of 8mm"),
-            ("L-Bracket", "L-bracket 100x80x10mm with 5mm fillets"),
-        ]:
-            btn = QtWidgets.QPushButton(label)
-            btn.setMaximumHeight(26)
-            btn.setStyleSheet("font-size:11px; padding:2px 6px;")
-            btn.clicked.connect(
-                lambda _=False, t=text: self.prompt_input.setPlainText(t)
+    def start(self):
+        if self.running:
+            return
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(1)
+            self.server_socket.setblocking(False)
+            self.timer = QtCore.QTimer()
+            self.timer.timeout.connect(self._poll)
+            self.timer.start(100)          # 10 Hz
+            self.running = True
+            FreeCAD.Console.PrintMessage(
+                f"[FreeCAD-MCP] Server listening on {self.host}:{self.port}\n"
             )
-            quick_row.addWidget(btn)
-        root.addLayout(quick_row)
+        except Exception as e:
+            FreeCAD.Console.PrintError(f"[FreeCAD-MCP] Bind failed: {e}\n")
+            self.stop()
 
-        btn_row = QtWidgets.QHBoxLayout()
+    def stop(self):
+        self.running = False
+        if self.timer:
+            self.timer.stop()
+            self.timer = None
+        for s in (self.client_socket, self.server_socket):
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        self.client_socket = None
+        self.server_socket = None
+        self.buffer = b""
+        FreeCAD.Console.PrintMessage("[FreeCAD-MCP] Server stopped\n")
 
-        self.generate_btn = QtWidgets.QPushButton("Generate Model")
-        self.generate_btn.setMinimumHeight(42)
-        self.generate_btn.setStyleSheet(
-            "QPushButton{font-size:15px; font-weight:bold; "
-            "background:#2196F3; color:white; border:none; "
-            "border-radius:8px; padding:10px 20px;}"
-        )
-        self.generate_btn.clicked.connect(self._on_generate)
-        btn_row.addWidget(self.generate_btn)
+    # ── Polling (runs on Qt main thread) ───────
 
-        self.modify_btn = QtWidgets.QPushButton("Add Feature")
-        self.modify_btn.setMinimumHeight(42)
-        self.modify_btn.setStyleSheet(
-            "QPushButton{font-size:13px; font-weight:bold; "
-            "background:#4CAF50; color:white; border:none; "
-            "border-radius:8px; padding:10px 15px;}"
-        )
-        self.modify_btn.clicked.connect(self._on_modify)
-        btn_row.addWidget(self.modify_btn)
+    def _poll(self):
+        if not self.running:
+            return
 
-        root.addLayout(btn_row)
+        # Accept new client
+        if self.client_socket is None and self.server_socket:
+            try:
+                self.client_socket, addr = self.server_socket.accept()
+                self.client_socket.setblocking(False)
+                FreeCAD.Console.PrintMessage(
+                    f"[FreeCAD-MCP] Client connected: {addr}\n"
+                )
+            except BlockingIOError:
+                pass
+            except Exception as e:
+                FreeCAD.Console.PrintError(
+                    f"[FreeCAD-MCP] Accept error: {e}\n"
+                )
 
-        btn_row2 = QtWidgets.QHBoxLayout()
-        new_btn = QtWidgets.QPushButton("New Document")
-        new_btn.clicked.connect(self._new_document)
-        btn_row2.addWidget(new_btn)
+        # Read from client
+        if self.client_socket:
+            try:
+                data = self.client_socket.recv(65536)
+                if data:
+                    self.buffer += data
+                    # Try to decode one complete JSON object
+                    try:
+                        command = json.loads(self.buffer.decode("utf-8"))
+                        self.buffer = b""
+                        response = self._route(command)
+                        payload = json.dumps(response).encode("utf-8")
+                        self.client_socket.sendall(payload)
+                    except json.JSONDecodeError:
+                        pass  # partial message — wait for more
+                else:
+                    # Client disconnected
+                    FreeCAD.Console.PrintMessage(
+                        "[FreeCAD-MCP] Client disconnected\n"
+                    )
+                    self.client_socket.close()
+                    self.client_socket = None
+                    self.buffer = b""
+            except BlockingIOError:
+                pass
+            except Exception as e:
+                FreeCAD.Console.PrintError(
+                    f"[FreeCAD-MCP] Recv error: {e}\n"
+                )
+                try:
+                    self.client_socket.close()
+                except Exception:
+                    pass
+                self.client_socket = None
+                self.buffer = b""
 
-        clear_btn = QtWidgets.QPushButton("Clear History")
-        clear_btn.clicked.connect(self._clear_history)
-        btn_row2.addWidget(clear_btn)
+    # ── Command Router ─────────────────────────
 
-        btn_row2.addWidget(QtWidgets.QLabel("Auto-fix:"))
-        self.autofix_check = QtWidgets.QCheckBox()
-        self.autofix_check.setChecked(True)
-        btn_row2.addWidget(self.autofix_check)
-        btn_row2.addStretch()
-        root.addLayout(btn_row2)
+    def _route(self, command):
+        cmd = command.get("type", "")
+        params = command.get("params", {})
 
-        code_label = QtWidgets.QLabel("Generated Code:")
-        code_label.setStyleSheet("font-weight:bold; font-size:13px;")
-        root.addWidget(code_label)
-
-        self.code_output = QtWidgets.QTextEdit()
-        self.code_output.setReadOnly(True)
-        self.code_output.setStyleSheet(
-            "QTextEdit{font-family:'Menlo','Monaco','Courier New',monospace;"
-            "font-size:12px; background:#1e1e1e; color:#d4d4d4; padding:10px; "
-            "border-radius:6px;}"
-        )
-        root.addWidget(self.code_output)
-
-        log_label = QtWidgets.QLabel("Log:")
-        log_label.setStyleSheet("font-weight:bold;")
-        root.addWidget(log_label)
-
-        self.log_output = QtWidgets.QTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setMaximumHeight(110)
-        self.log_output.setStyleSheet(
-            "QTextEdit{font-family:monospace; font-size:11px; "
-            "background:#1e1e1e; padding:5px; border-radius:4px;}"
-        )
-        root.addWidget(self.log_output)
-
-        shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self)
-        shortcut.activated.connect(self._on_generate)
-
-    def _set_status(self, text, color="black"):
-        palette = {
-            "green": ("#E8F5E9", "#2E7D32"),
-            "red": ("#FFEBEE", "#C62828"),
-            "blue": ("#E3F2FD", "#1565C0"),
-            "orange": ("#FFF3E0", "#E65100"),
-            "black": ("#F5F5F5", "#333333"),
+        HANDLERS = {
+            "ping":               self.cmd_ping,
+            "get_scene_info":     self.cmd_get_scene_info,
+            "create_object":      self.cmd_create_object,
+            "modify_object":      self.cmd_modify_object,
+            "delete_object":      self.cmd_delete_object,
+            "get_object_info":    self.cmd_get_object_info,
+            "execute_code":       self.cmd_execute_code,
+            "boolean_operation":  self.cmd_boolean_operation,
+            "fillet_edges":       self.cmd_fillet_edges,
+            "chamfer_edges":      self.cmd_chamfer_edges,
+            "export_model":       self.cmd_export_model,
+            "set_color":          self.cmd_set_color,
+            "fit_view":           self.cmd_fit_view,
+            "capture_view":       self.cmd_capture_view,
+            "new_document":       self.cmd_new_document,
+            "clear_document":     self.cmd_clear_document,
         }
-        bg, fg = palette.get(color, palette["black"])
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(
-            "padding:5px 10px; border-radius:4px; font-weight:bold; "
-            f"background-color:{bg}; color:{fg};"
-        )
 
-    def _log(self, msg):
-        self.log_output.append(msg)
-        sb = self.log_output.verticalScrollBar()
-        sb.setValue(sb.maximum())
-        FreeCAD.Console.PrintMessage(f"[AI-Gen] {msg}\n")
+        handler = HANDLERS.get(cmd)
+        if not handler:
+            return {"status": "error",
+                    "message": f"Unknown command: {cmd}",
+                    "available": list(HANDLERS.keys())}
+        try:
+            result = handler(**params)
+            return {"status": "success", "result": result}
+        except Exception as e:
+            tb = traceback.format_exc()
+            FreeCAD.Console.PrintError(f"[FreeCAD-MCP] {cmd}: {e}\n")
+            return {"status": "error", "message": str(e), "traceback": tb}
 
-    def _ensure_document(self):
+    # ── Helpers ─────────────────────────────────
+
+    def _ensure_doc(self):
         if FreeCAD.ActiveDocument is None:
-            self._new_document()
+            FreeCAD.newDocument("MCP_Model")
         return FreeCAD.ActiveDocument
 
-    def _new_document(self):
-        self.generation_count += 1
-        name = f"AI_Model_{self.generation_count}"
-        FreeCAD.newDocument(name)
-        self._log(f"New document: {name}")
-        self._set_status(f"New document: {name}", "blue")
+    def _find_obj(self, name):
+        doc = self._ensure_doc()
+        obj = doc.getObject(name)
+        if obj:
+            return obj
+        for o in doc.Objects:
+            if o.Label == name:
+                return o
+        raise ValueError(f"Object not found: '{name}'")
 
-    def _clear_history(self):
-        self.ollama.clear_history()
-        self._log("History cleared")
-        self._set_status("History cleared", "blue")
+    def _obj_dict(self, obj):
+        """Serialize a FreeCAD object to a JSON-safe dict."""
+        d = {
+            "name": obj.Name,
+            "label": obj.Label,
+            "type": obj.TypeId,
+            "placement": {
+                "x": round(obj.Placement.Base.x, 4),
+                "y": round(obj.Placement.Base.y, 4),
+                "z": round(obj.Placement.Base.z, 4),
+            },
+        }
+        for prop in ("Length", "Width", "Height",
+                      "Radius", "Radius1", "Radius2"):
+            if hasattr(obj, prop):
+                d[prop.lower()] = round(float(getattr(obj, prop)), 4)
 
-    def _display_code(self, code):
-        numbered = []
-        for i, line in enumerate(code.split("\n"), 1):
-            numbered.append(f"{i:4d} │ {line}")
-        self.code_output.setPlainText("\n".join(numbered))
+        if HAS_GUI and hasattr(obj, "ViewObject"):
+            vo = obj.ViewObject
+            d["visible"] = vo.Visibility
+            try:
+                c = vo.ShapeColor
+                d["color"] = [round(c[0], 3), round(c[1], 3), round(c[2], 3)]
+            except Exception:
+                pass
+        return d
 
-    def _fit_view(self):
-        try:
-            import FreeCADGui
+    def _recompute(self):
+        doc = self._ensure_doc()
+        doc.recompute()
 
-            if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
-                FreeCADGui.ActiveDocument.ActiveView.fitAll()
-        except Exception:
-            pass
+    def _fit(self):
+        if HAS_GUI:
+            try:
+                v = FreeCADGui.ActiveDocument.ActiveView
+                if v:
+                    v.fitAll()
+            except Exception:
+                pass
 
-    def _check_ollama(self):
-        if self.ollama.is_running():
-            self._set_status("Ollama connected", "green")
-            self._refresh_models()
+    # ═══════════════════════════════════════════
+    # COMMAND HANDLERS
+    # ═══════════════════════════════════════════
+
+    def cmd_ping(self):
+        ver = FreeCAD.Version()
+        return {
+            "alive": True,
+            "freecad_version": f"{ver[0]}.{ver[1]}",
+            "has_gui": HAS_GUI,
+            "document": (FreeCAD.ActiveDocument.Name
+                         if FreeCAD.ActiveDocument else None),
+        }
+
+    # ── Scene ──────────────────────────────────
+
+    def cmd_get_scene_info(self):
+        doc = self._ensure_doc()
+        objects = [self._obj_dict(o) for o in doc.Objects]
+        return {
+            "document_name": doc.Name,
+            "document_label": doc.Label,
+            "object_count": len(objects),
+            "objects": objects,
+        }
+
+    # ── Create ─────────────────────────────────
+
+    def cmd_create_object(self, type="BOX", name=None,
+                          location=None, rotation=None, **kw):
+        doc = self._ensure_doc()
+        t = type.upper()
+
+        if t == "BOX":
+            obj = doc.addObject("Part::Box", name or "Box")
+            obj.Length = kw.get("length", 10)
+            obj.Width  = kw.get("width",  10)
+            obj.Height = kw.get("height", 10)
+        elif t == "CYLINDER":
+            obj = doc.addObject("Part::Cylinder", name or "Cylinder")
+            obj.Radius = kw.get("radius", 5)
+            obj.Height = kw.get("height", 10)
+        elif t == "SPHERE":
+            obj = doc.addObject("Part::Sphere", name or "Sphere")
+            obj.Radius = kw.get("radius", 5)
+        elif t == "CONE":
+            obj = doc.addObject("Part::Cone", name or "Cone")
+            obj.Radius1 = kw.get("radius1", 10)
+            obj.Radius2 = kw.get("radius2", 0)
+            obj.Height  = kw.get("height",  10)
+        elif t == "TORUS":
+            obj = doc.addObject("Part::Torus", name or "Torus")
+            obj.Radius1 = kw.get("radius1", 20)
+            obj.Radius2 = kw.get("radius2", 5)
         else:
-            self._set_status("Ollama not running — start `ollama serve`", "red")
-            self.generate_btn.setEnabled(False)
-            self.modify_btn.setEnabled(False)
-
-    def _refresh_models(self):
-        models = self.ollama.get_models()
-        current = self.model_combo.currentText()
-        self.model_combo.clear()
-        if models:
-            self.model_combo.addItems(models)
-            idx = self.model_combo.findText(current)
-            if idx >= 0:
-                self.model_combo.setCurrentIndex(idx)
-            self._log(f"Models: {', '.join(models)}")
-        else:
-            self.model_combo.addItem(OLLAMA_MODEL)
-            self._log("Could not fetch models, using default only")
-
-    def _on_generate(self):
-        prompt = self.prompt_input.toPlainText().strip()
-        if not prompt:
-            self._set_status("Enter a description first", "orange")
-            return
-
-        self.ollama.model = self.model_combo.currentText()
-        self._new_document()
-        doc = FreeCAD.ActiveDocument
-        self._generate_and_execute(prompt, doc)
-
-    def _on_modify(self):
-        prompt = self.prompt_input.toPlainText().strip()
-        if not prompt:
-            self._set_status("Enter a description first", "orange")
-            return
-
-        self.ollama.model = self.model_combo.currentText()
-        doc = self._ensure_document()
-        enhanced = (
-            "The document already has objects. "
-            "Do NOT recreate existing shapes. Only add:\n" + prompt
-        )
-        self._generate_and_execute(enhanced, doc)
-
-    def _generate_and_execute(self, prompt, doc):
-        self.generate_btn.setEnabled(False)
-        self.modify_btn.setEnabled(False)
-        self._set_status("Generating code with Ollama…", "blue")
-        self.code_output.clear()
-        QtWidgets.QApplication.processEvents()
-
-        try:
-            self._log(f"Prompt: {prompt}")
-            code, raw = self.ollama.generate(prompt)
-            self.last_code = code
-            self._display_code(code)
-            self._log(
-                f"Generated {len(code)} chars, {code.count(chr(10)) + 1} lines"
+            raise ValueError(
+                f"Unknown type '{type}'. "
+                "Use: BOX, CYLINDER, SPHERE, CONE, TORUS"
             )
 
-            self._set_status("Executing code…", "blue")
-            QtWidgets.QApplication.processEvents()
+        if name:
+            obj.Label = name
+        if location:
+            obj.Placement.Base = FreeCAD.Vector(*location)
+        if rotation:
+            if len(rotation) == 4:
+                obj.Placement.Rotation = FreeCAD.Rotation(
+                    FreeCAD.Vector(*rotation[:3]), rotation[3])
+            elif len(rotation) == 3:
+                obj.Placement.Rotation = FreeCAD.Rotation(*rotation)
 
-            ok, msg = execute_code(code, doc)
-            if ok:
-                self._set_status("Model created successfully!", "green")
-                self._log(f"OK: {msg}")
-                self._fit_view()
-                return
+        self._recompute()
+        self._fit()
+        return self._obj_dict(obj)
 
-            self._set_status("Execution error", "red")
-            self._log(f"Error: {msg}")
+    # ── Modify ─────────────────────────────────
 
-            if self.autofix_check.isChecked():
-                self._log("Attempting auto-fix…")
-                self._set_status("Auto-fixing code…", "orange")
-                QtWidgets.QApplication.processEvents()
+    def cmd_modify_object(self, name, location=None,
+                          rotation=None, visible=None,
+                          label=None, **kw):
+        obj = self._find_obj(name)
 
-                fixed_code, _ = self.ollama.fix_code(code, msg)
-                self.last_code = fixed_code
-                self._display_code(fixed_code)
+        if location:
+            obj.Placement.Base = FreeCAD.Vector(*location)
+        if rotation:
+            if len(rotation) == 4:
+                obj.Placement.Rotation = FreeCAD.Rotation(
+                    FreeCAD.Vector(*rotation[:3]), rotation[3])
+            elif len(rotation) == 3:
+                obj.Placement.Rotation = FreeCAD.Rotation(*rotation)
+        if visible is not None and HAS_GUI:
+            obj.ViewObject.Visibility = visible
+        if label:
+            obj.Label = label
 
-                ok2, msg2 = execute_code(fixed_code, doc)
-                if ok2:
-                    self._set_status("Auto-fix successful!", "green")
-                    self._log(f"OK: {msg2}")
-                    self._fit_view()
-                else:
-                    self._set_status("Auto-fix failed", "red")
-                    self._log(f"Fix failed: {msg2}")
+        DIM_MAP = {
+            "length": "Length", "width": "Width", "height": "Height",
+            "radius": "Radius", "radius1": "Radius1", "radius2": "Radius2",
+        }
+        for k, v in kw.items():
+            prop = DIM_MAP.get(k.lower())
+            if prop and hasattr(obj, prop):
+                setattr(obj, prop, float(v))
 
-        except URLError as e:
-            self._set_status("Cannot reach Ollama", "red")
-            self._log(f"Connection error: {e}")
+        self._recompute()
+        return self._obj_dict(obj)
 
-        except Exception as e:
-            self._set_status("Error", "red")
-            self._log(traceback.format_exc())
+    # ── Delete ─────────────────────────────────
 
-        finally:
-            self.generate_btn.setEnabled(True)
-            self.modify_btn.setEnabled(True)
+    def cmd_delete_object(self, name):
+        doc = self._ensure_doc()
+        obj = self._find_obj(name)
+        info = {"deleted_name": obj.Name, "deleted_label": obj.Label}
+        doc.removeObject(obj.Name)
+        self._recompute()
+        return info
 
+    # ── Info ───────────────────────────────────
 
-def launch():
-    """Launch the AI Model Generator dialog."""
-    parent = None
-    try:
-        import FreeCADGui
+    def cmd_get_object_info(self, name):
+        obj = self._find_obj(name)
+        info = self._obj_dict(obj)
 
-        parent = FreeCADGui.getMainWindow()
-    except Exception:
-        parent = None
-
-    dlg = AIModelGeneratorDialog(parent=parent)
-    dlg.show()
-    return dlg
-
-
-_dialog = launch()
-
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-"""
-🏭 AI 3D Model Generator for FreeCAD
-===================================
-Type a prompt → Get a 3D model inside FreeCAD.
-
-Uses Ollama (local LLM) to generate FreeCAD Python code and executes it
-in the current document. No external Python packages are required.
-"""
-
-# ═══════════════════════════════════════════════════
-# CONFIGURATION
-# ═══════════════════════════════════════════════════
-
-OLLAMA_URL = "http://127.0.0.1:11434"
-OLLAMA_MODEL = "qwen3-coder:480b-cloud"  # Change if you prefer another model
-
-
-# ═══════════════════════════════════════════════════
-# IMPORTS
-# ═══════════════════════════════════════════════════
-
-import FreeCAD
-import Part
-import json
-import re
-import traceback
-import builtins
-
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-
-try:
-    from PySide2 import QtCore, QtGui, QtWidgets
-except ImportError:
-    try:
-        from PySide6 import QtCore, QtGui, QtWidgets
-    except ImportError:
-        from PySide import QtCore, QtGui
-        QtWidgets = QtGui
-
-
-# SYSTEM PROMPT — teaches the LLM FreeCAD's API
-
-SYSTEM_PROMPT = r"""You are an expert FreeCAD automation engineer. You write Python code that creates 3D models using FreeCAD's Python API.
-
-## CRITICAL RULES:
-1. Output ONLY a single Python code block. No explanations.
-2. Do NOT import FreeCAD or Part — already available.
-3. Do NOT create a document — `doc` already exists.
-4. Always call `doc.recompute()` at the very end.
-5. All measurements in millimeters (mm).
-6. Give every object a `.Label`.
-
-## AVAILABLE VARIABLES:
-- `FreeCAD` / `App` — FreeCAD module
-- `Part` — Part module
-- `doc` — active document
-- `Vector(x,y,z)` — FreeCAD.Vector
-- `Placement(pos, rot)` — FreeCAD.Placement
-- `Rotation(axis, angle)` — FreeCAD.Rotation
-
-## RULES:
-- Use doc.addObject(\"Part::Box\", \"Name\") for parametric primitives
-- Boolean Cut: .Base and .Tool
-- Boolean Fuse: .Shape1 and .Shape2
-- Hide intermediates: obj.Visibility = False
-- Close wire loops for extrusion
-- doc.recompute() MUST be the last call
-- Output ONLY code. No text before or after.
-"""
-
-
-# ═══════════════════════════════════════════════════
-# OLLAMA API CLIENT (urllib — no extra deps)
-# ═══════════════════════════════════════════════════
-
-
-class OllamaClient:
-    """Minimal Ollama chat client using built-in urllib."""
-
-    def __init__(self, base_url=OLLAMA_URL, model=OLLAMA_MODEL):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.history = []  # list of {role, content}
-
-    def is_running(self):
-        """Quick ping to see if Ollama is reachable."""
-        try:
-            req = Request(f"{self.base_url}/api/tags")
-            resp = urlopen(req, timeout=3)
-            return getattr(resp, "status", 200) == 200
-        except Exception:
-            return False
-
-    def get_models(self):
-        """Return a list of local model names."""
-        try:
-            req = Request(f"{self.base_url}/api/tags")
-            resp = urlopen(req, timeout=5)
-            data = json.loads(resp.read().decode())
-            return [m.get("name", m.get("model", "")) for m in data.get("models", [])]
-        except Exception:
-            return []
-
-    # ── core chat helpers ─────────────────────────
-
-    def _chat(self, messages, stream=False):
-        payload = json.dumps(
-            {
-                "model": self.model,
-                "messages": messages,
-                "stream": False,  # keep it simple; no streaming here
-                "options": {
-                    "temperature": 0.15,
-                    "top_p": 0.9,
-                    "num_predict": 4096,
+        if hasattr(obj, "Shape"):
+            s = obj.Shape
+            info["shape"] = {
+                "volume_mm3": round(s.Volume, 2),
+                "area_mm2":   round(s.Area, 2),
+                "faces":      len(s.Faces),
+                "edges":      len(s.Edges),
+                "vertices":   len(s.Vertexes),
+                "bbox": {
+                    "min": [round(s.BoundBox.XMin, 2),
+                            round(s.BoundBox.YMin, 2),
+                            round(s.BoundBox.ZMin, 2)],
+                    "max": [round(s.BoundBox.XMax, 2),
+                            round(s.BoundBox.YMax, 2),
+                            round(s.BoundBox.ZMax, 2)],
                 },
             }
-        ).encode("utf-8")
 
-        req = Request(
-            f"{self.base_url}/api/chat",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        props = {}
+        for p in obj.PropertiesList:
+            try:
+                val = getattr(obj, p)
+                if isinstance(val, (int, float, str, bool)):
+                    props[p] = val
+            except Exception:
+                pass
+        info["properties"] = props
+        return info
 
-        resp = urlopen(req, timeout=300)
-        result = json.loads(resp.read().decode())
-        return result.get("message", {}).get("content", "")
+    # ── Execute Arbitrary Code ─────────────────
 
-    def generate(self, prompt, add_to_history=True):
-        """Generate FreeCAD code for the given prompt."""
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend(self.history)
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Generate FreeCAD Python code for:\n\n"
-                    f"{prompt}\n\n"
-                    "Output ONLY Python code. No explanations."
-                ),
-            }
-        )
+    def cmd_execute_code(self, code):
+        doc = self._ensure_doc()
+        ns = {
+            "__builtins__": builtins,
+            "FreeCAD": FreeCAD, "App": FreeCAD,
+            "Part": Part,
+            "doc": doc, "document": doc,
+            "Vector": FreeCAD.Vector,
+            "Placement": FreeCAD.Placement,
+            "Rotation": FreeCAD.Rotation,
+            "math": math,
+        }
 
-        raw_text = self._chat(messages)
-        code = self._extract_code(raw_text)
-        code = self._clean_code(code)
+        try:
+            exec(code, ns)
+            doc.recompute()
+            self._fit()
+            return {"executed": True,
+                    "message": "Code executed successfully"}
+        except Exception as e:
+            tb = traceback.format_exc()
+            # Extract line info
+            m = re.search(r'File .+, line (\d+)', tb)
+            line_info = ""
+            if m:
+                lineno = int(m.group(1))
+                lines = code.split("\n")
+                if 1 <= lineno <= len(lines):
+                    line_info = f" | line {lineno}: {lines[lineno-1].strip()}"
+            raise Exception(f"{type(e).__name__}: {e}{line_info}")
 
-        if add_to_history:
-            self.history.append({"role": "user", "content": prompt})
-            self.history.append({"role": "assistant", "content": raw_text})
-            if len(self.history) > 20:
-                self.history = self.history[-20:]
+    # ── Boolean Operations ─────────────────────
 
-        return code, raw_text
+    def cmd_boolean_operation(self, operation, base, tool, name=None):
+        doc = self._ensure_doc()
+        base_obj = self._find_obj(base)
+        tool_obj = self._find_obj(tool)
 
-    def fix_code(self, code, error):
-        """Ask the LLM to fix failing FreeCAD code."""
-        fix_prompt = (
-            "This FreeCAD code produced an error. Fix it completely.\n\n"
-            f"CODE:\n```python\n{code}\n```\n\n"
-            f"ERROR:\n```\n{error}\n```\n\n"
-            "Return ONLY the fixed Python code."
-        )
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.append(
-            {
-                "role": "user",
-                "content": fix_prompt,
-            }
-        )
-        raw_text = self._chat(messages)
-        code = self._extract_code(raw_text)
-        code = self._clean_code(code)
-        return code, raw_text
+        op = operation.lower()
+        if op == "cut":
+            result = doc.addObject("Part::Cut", name or "Cut")
+        elif op in ("fuse", "union", "join"):
+            result = doc.addObject("Part::Fuse", name or "Fuse")
+        elif op in ("common", "intersect", "intersection"):
+            result = doc.addObject("Part::Common", name or "Common")
+        else:
+            raise ValueError(
+                f"Unknown operation '{operation}'. Use: cut, fuse, common"
+            )
 
-    def clear_history(self):
-        self.history.clear()
+        result.Base = base_obj
+        result.Tool = tool_obj
+        if name:
+            result.Label = name
 
-    # ── response post-processing ────────────────
+        if HAS_GUI:
+            base_obj.ViewObject.Visibility = False
+            tool_obj.ViewObject.Visibility = False
 
-    @staticmethod
-    def _extract_code(text):
-        """Extract Python code from markdown fences or return raw text."""
-        if not text:
-            return "doc.recompute()"
+        self._recompute()
+        self._fit()
+        return self._obj_dict(result)
 
-        # ```python ... ```
-        m = re.findall(r"```python\s*\n(.*?)```", text, re.DOTALL)
-        if m:
-            return "\n\n".join(x.strip() for x in m)
+    # ── Fillet / Chamfer ───────────────────────
 
-        # ``` ... ```
-        m = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
-        if m:
-            return "\n\n".join(x.strip() for x in m)
+    def cmd_fillet_edges(self, name, radius=1.0):
+        doc = self._ensure_doc()
+        obj = self._find_obj(name)
+        if not hasattr(obj, "Shape"):
+            raise ValueError(f"'{name}' has no shape")
+        edges = obj.Shape.Edges
+        if not edges:
+            raise ValueError(f"'{name}' has no edges")
+        fillet = obj.Shape.makeFillet(float(radius), edges)
+        r = doc.addObject("Part::Feature", f"{obj.Label}_Fillet")
+        r.Shape = fillet
+        r.Label = f"{obj.Label}_Fillet"
+        if HAS_GUI:
+            obj.ViewObject.Visibility = False
+        self._recompute()
+        self._fit()
+        return self._obj_dict(r)
 
-        return text.strip()
+    def cmd_chamfer_edges(self, name, size=1.0):
+        doc = self._ensure_doc()
+        obj = self._find_obj(name)
+        if not hasattr(obj, "Shape"):
+            raise ValueError(f"'{name}' has no shape")
+        edges = obj.Shape.Edges
+        if not edges:
+            raise ValueError(f"'{name}' has no edges")
+        chamfer = obj.Shape.makeChamfer(float(size), edges)
+        r = doc.addObject("Part::Feature", f"{obj.Label}_Chamfer")
+        r.Shape = chamfer
+        r.Label = f"{obj.Label}_Chamfer"
+        if HAS_GUI:
+            obj.ViewObject.Visibility = False
+        self._recompute()
+        self._fit()
+        return self._obj_dict(r)
 
-    @staticmethod
-    def _clean_code(code):
-        """Strip lines that fight against our pre-built environment."""
-        if not code:
-            return code
+    # ── Export ──────────────────────────────────
 
-        skip_markers = [
-            "import freecad",
-            "import part",
-            "from freecad",
-            "sys.path",
-            "app.newdocument",
-            "freecad.newdocument",
-            "doc = app",
-            "doc = freecad",
-            "doc=app",
-            "document = app",
-        ]
+    def cmd_export_model(self, filepath, format=None):
+        doc = self._ensure_doc()
+        if not format:
+            format = os.path.splitext(filepath)[1].lstrip(".").lower()
 
-        cleaned = []
-        for line in code.split("\n"):
-            low = line.strip().lower()
-            if any(s in low for s in skip_markers):
-                cleaned.append(f"# [auto-removed]: {line}")
-            else:
-                cleaned.append(line)
-        return "\n".join(cleaned)
+        objs = [o for o in doc.Objects
+                if hasattr(o, "Shape")
+                and (not HAS_GUI
+                     or not hasattr(o, "ViewObject")
+                     or o.ViewObject.Visibility)]
+        if not objs:
+            raise ValueError("No visible shapes to export")
+
+        d = os.path.dirname(os.path.abspath(filepath))
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+        if format in ("step", "stp", "iges", "igs", "brep"):
+            Part.export(objs, filepath)
+        elif format == "stl":
+            try:
+                import Mesh
+                Mesh.export(objs, filepath)
+            except ImportError:
+                shapes = [o.Shape for o in objs]
+                Part.makeCompound(shapes).exportStl(filepath)
+        elif format == "fcstd":
+            doc.saveAs(filepath)
+        else:
+            Part.export(objs, filepath)
+
+        return {"exported": True, "filepath": filepath,
+                "format": format, "objects": len(objs)}
+
+    # ── Appearance ─────────────────────────────
+
+    def cmd_set_color(self, name, color):
+        if not HAS_GUI:
+            return {"message": "No GUI — cannot set color"}
+        obj = self._find_obj(name)
+        r, g, b = color[0], color[1], color[2]
+        if max(r, g, b) > 1:
+            r, g, b = r / 255, g / 255, b / 255
+        obj.ViewObject.ShapeColor = (r, g, b, 0.0)
+        if len(color) >= 4:
+            t = color[3]
+            if t > 1:
+                t = t / 255
+            obj.ViewObject.Transparency = int(t * 100)
+        return self._obj_dict(obj)
+
+    # ── View ───────────────────────────────────
+
+    def cmd_fit_view(self):
+        self._fit()
+        return {"fitted": True}
+
+    def cmd_capture_view(self, filepath=None, width=800, height=600):
+        if not HAS_GUI:
+            return {"error": "No GUI available"}
+        if not filepath:
+            filepath = os.path.join(
+                tempfile.gettempdir(), "freecad_capture.png"
+            )
+        d = os.path.dirname(os.path.abspath(filepath))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        view = FreeCADGui.ActiveDocument.ActiveView
+        view.saveImage(filepath, width, height)
+        return {"captured": True, "filepath": filepath,
+                "width": width, "height": height}
+
+    # ── Document ───────────────────────────────
+
+    def cmd_new_document(self, name="MCP_Model"):
+        doc = FreeCAD.newDocument(name)
+        return {"document_name": doc.Name, "document_label": doc.Label}
+
+    def cmd_clear_document(self):
+        doc = self._ensure_doc()
+        names = [o.Name for o in doc.Objects]
+        for n in reversed(names):
+            try:
+                doc.removeObject(n)
+            except Exception:
+                pass
+        doc.recompute()
+        return {"cleared": True, "removed": len(names)}
 
 
 # ═══════════════════════════════════════════════════
-# CODE EXECUTION HELPER
+# UI PANEL
 # ═══════════════════════════════════════════════════
 
-
-def execute_code(code, doc):
-    """
-    Execute generated code inside FreeCAD.
-    Returns (success: bool, message: str).
-    """
-    # Execution namespace
-    namespace = {
-        "FreeCAD": FreeCAD,
-        "App": FreeCAD,
-        "Part": Part,
-        "doc": doc,
-        "document": doc,
-        "Vector": FreeCAD.Vector,
-        "Placement": FreeCAD.Placement,
-        "Rotation": FreeCAD.Rotation,
-        # Common builtins
-        "range": range,
-        "len": len,
-        "enumerate": enumerate,
-        "zip": zip,
-        "map": map,
-        "filter": filter,
-        "int": int,
-        "float": float,
-        "str": str,
-        "bool": bool,
-        "list": list,
-        "dict": dict,
-        "tuple": tuple,
-        "set": set,
-        "abs": abs,
-        "round": round,
-        "min": min,
-        "max": max,
-        "sum": sum,
-        "pow": pow,
-        "print": FreeCAD.Console.PrintMessage,
-        "sorted": sorted,
-        "reversed": reversed,
-        "any": any,
-        "all": all,
-        "isinstance": isinstance,
-        "hasattr": hasattr,
-        "getattr": getattr,
-        "True": True,
-        "False": False,
-        "None": None,
-        "builtins": builtins,
-    }
-
-    try:
-        import math
-
-        namespace["math"] = math
-    except Exception:
-        pass
-
-    try:
-        exec(code, namespace)
-        return True, "Model created successfully!"
-    except Exception as e:
-        tb = traceback.format_exc()
-        m = re.search(r'File ["\']<string>["\'], line (\d+)', tb)
-        if m:
-            lineno = int(m.group(1))
-            lines = code.split("\n")
-            if 1 <= lineno <= len(lines):
-                return (
-                    False,
-                    f"{type(e).__name__}: {e}\n\n"
-                    f"Line {lineno}: {lines[lineno - 1].strip()}",
-                )
-        return False, f"{type(e).__name__}: {e}\n\n{tb}"
-
-
-# ═══════════════════════════════════════════════════
-# MAIN DIALOG
-# ═══════════════════════════════════════════════════
-
-
-class AIModelGeneratorDialog(QtWidgets.QDialog):
-    """Main dialog window for the AI 3D Model Generator."""
+class FreeCADMCPPanel(QtWidgets.QDialog):
+    """Minimal control panel for the MCP server."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.ollama = OllamaClient()
-        self.last_code = ""
-        self.generation_count = 0
-        self._setup_ui()
-        self._check_ollama()
+        self.server = None
+        self._build()
 
-    # ── UI ─────────────────────────────────────
-
-    def _setup_ui(self):
-        self.setWindowTitle("🏭 AI 3D Model Generator")
-        self.setMinimumSize(720, 620)
-        self.resize(820, 720)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(8)
+    def _build(self):
+        self.setWindowTitle("FreeCAD MCP")
+        self.setFixedWidth(340)
+        ly = QtWidgets.QVBoxLayout(self)
+        ly.setSpacing(10)
 
         # Header
-        header = QtWidgets.QLabel(
-            "🏭 AI 3D Model Generator\n"
-            "Describe a 3D model → Ollama generates it → appears in FreeCAD"
+        hdr = QtWidgets.QLabel("FreeCAD MCP Server")
+        hdr.setAlignment(QtCore.Qt.AlignCenter)
+        hdr.setStyleSheet(
+            "font-size:15px; font-weight:bold; "
+            "padding:8px; color:#1565C0;"
         )
-        header.setAlignment(QtCore.Qt.AlignCenter)
-        header.setStyleSheet(
-            "font-size:16px; font-weight:bold; padding:10px; color:#2196F3;"
-        )
-        layout.addWidget(header)
+        ly.addWidget(hdr)
 
-        # Status label
-        self.status_label = QtWidgets.QLabel("Checking Ollama…")
-        self.status_label.setStyleSheet(
-            "padding:5px 10px; border-radius:4px; font-weight:bold;"
+        # Status
+        self.status = QtWidgets.QLabel("● Stopped")
+        self.status.setAlignment(QtCore.Qt.AlignCenter)
+        self.status.setStyleSheet(
+            "padding:6px; border-radius:4px; font-weight:bold;"
+            "background:#FFEBEE; color:#C62828;"
         )
-        layout.addWidget(self.status_label)
+        ly.addWidget(self.status)
 
-        # Model selector
+        # Port
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Model:"))
-        self.model_combo = QtWidgets.QComboBox()
-        self.model_combo.setMinimumWidth(260)
-        self.model_combo.setEditable(True)
-        self.model_combo.addItem(OLLAMA_MODEL)
-        row.addWidget(self.model_combo)
-        refresh_btn = QtWidgets.QPushButton("🔄 Refresh")
-        refresh_btn.clicked.connect(self._refresh_models)
-        row.addWidget(refresh_btn)
+        row.addWidget(QtWidgets.QLabel("Port:"))
+        self.port_spin = QtWidgets.QSpinBox()
+        self.port_spin.setRange(1024, 65535)
+        self.port_spin.setValue(DEFAULT_PORT)
+        row.addWidget(self.port_spin)
         row.addStretch()
-        layout.addLayout(row)
+        ly.addLayout(row)
 
-        # Prompt input
-        prompt_label = QtWidgets.QLabel("Describe your 3D model:")
-        prompt_label.setStyleSheet("font-weight:bold; font-size:13px;")
-        layout.addWidget(prompt_label)
-
-        self.prompt_input = QtWidgets.QTextEdit()
-        self.prompt_input.setPlaceholderText(
-            "Examples:\n"
-            "• Create a cube with 50mm sides\n"
-            "• Plate 200x100x10mm with 4 corner holes of 8mm diameter\n"
-            "• Hollow cylinder OD=60mm ID=50mm length=100mm\n"
-            "• L-bracket 100x80x10mm with 5mm fillets"
-        )
-        self.prompt_input.setMaximumHeight(120)
-        self.prompt_input.setStyleSheet(
-            "QTextEdit{font-size:13px; padding:8px; border:2px solid #ccc; "
-            "border-radius:6px;} QTextEdit:focus{border-color:#2196F3;}"
-        )
-        layout.addWidget(self.prompt_input)
-
-        # Quick prompts
-        quick_row = QtWidgets.QHBoxLayout()
-        for label, text in [
-            ("📦 Cube", "Create a cube with 50mm sides"),
-            ("🔵 Cylinder", "Create a cylinder radius 25mm height 80mm"),
-            (
-                "🕳️ Plate+Holes",
-                "Create a plate 200x100x10mm with 4 corner holes of 8mm",
-            ),
-            ("📐 L-Bracket", "Create an L-bracket 100x80x10mm with 5mm fillets"),
-        ]:
-            btn = QtWidgets.QPushButton(label)
-            btn.setMaximumHeight(28)
-            btn.setStyleSheet("font-size:11px; padding:2px 6px;")
-            btn.clicked.connect(
-                lambda _=False, t=text: self.prompt_input.setPlainText(t)
-            )
-            quick_row.addWidget(btn)
-        layout.addLayout(quick_row)
-
-        # Action buttons
-        btn_row = QtWidgets.QHBoxLayout()
-
-        self.generate_btn = QtWidgets.QPushButton("🚀 Generate Model")
-        self.generate_btn.setMinimumHeight(44)
-        self.generate_btn.setStyleSheet(
-            "QPushButton{font-size:15px; font-weight:bold; "
-            "background:#2196F3; color:white; border:none; "
-            "border-radius:8px; padding:10px 20px;}"
-            "QPushButton:hover{background:#1976D2;}"
-            "QPushButton:pressed{background:#0D47A1;}"
-            "QPushButton:disabled{background:#90CAF9;}"
-        )
-        self.generate_btn.clicked.connect(self._on_generate)
-        btn_row.addWidget(self.generate_btn)
-
-        self.modify_btn = QtWidgets.QPushButton("➕ Add Feature")
-        self.modify_btn.setMinimumHeight(44)
-        self.modify_btn.setStyleSheet(
-            "QPushButton{font-size:13px; font-weight:bold; "
-            "background:#4CAF50; color:white; border:none; "
-            "border-radius:8px; padding:10px 15px;}"
+        # Start / Stop
+        self.btn = QtWidgets.QPushButton("Start Server")
+        self.btn.setMinimumHeight(38)
+        self.btn.setStyleSheet(
+            "QPushButton{font-size:13px;font-weight:bold;"
+            "background:#43A047;color:white;border:none;"
+            "border-radius:6px;padding:8px;}"
             "QPushButton:hover{background:#388E3C;}"
-            "QPushButton:disabled{background:#A5D6A7;}"
         )
-        self.modify_btn.clicked.connect(self._on_modify)
-        btn_row.addWidget(self.modify_btn)
+        self.btn.clicked.connect(self._toggle)
+        ly.addWidget(self.btn)
 
-        layout.addLayout(btn_row)
-
-        # Secondary buttons
-        btn_row2 = QtWidgets.QHBoxLayout()
-        new_btn = QtWidgets.QPushButton("📄 New Document")
-        new_btn.clicked.connect(self._new_document)
-        btn_row2.addWidget(new_btn)
-
-        clear_btn = QtWidgets.QPushButton("🗑️ Clear History")
-        clear_btn.clicked.connect(self._clear_history)
-        btn_row2.addWidget(clear_btn)
-
-        btn_row2.addWidget(QtWidgets.QLabel("Auto-fix:"))
-        self.autofix_check = QtWidgets.QCheckBox()
-        self.autofix_check.setChecked(True)
-        btn_row2.addWidget(self.autofix_check)
-        btn_row2.addStretch()
-        layout.addLayout(btn_row2)
-
-        # Code output
-        code_label = QtWidgets.QLabel("Generated Code:")
-        code_label.setStyleSheet("font-weight:bold; font-size:13px;")
-        layout.addWidget(code_label)
-
-        self.code_output = QtWidgets.QTextEdit()
-        self.code_output.setReadOnly(True)
-        self.code_output.setStyleSheet(
-            "QTextEdit{font-family:'Menlo','Monaco','Courier New',monospace;"
-            "font-size:12px; background:#1e1e1e; color:#d4d4d4; padding:10px; "
-            "border-radius:6px;}"
+        # Instructions
+        info = QtWidgets.QLabel(
+            "1. Click Start Server\n"
+            "2. Run freecad_mcp_server.py externally\n"
+            "3. Connect Claude Desktop or any MCP client\n\n"
+            "The MCP bridge connects to this socket and\n"
+            "translates MCP tool calls → FreeCAD commands."
         )
-        layout.addWidget(self.code_output)
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#666; font-size:11px; padding:4px;")
+        ly.addWidget(info)
+        ly.addStretch()
 
-        # Log output
-        log_label = QtWidgets.QLabel("Log:")
-        log_label.setStyleSheet("font-weight:bold;")
-        layout.addWidget(log_label)
-
-        self.log_output = QtWidgets.QTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setMaximumHeight(110)
-        self.log_output.setStyleSheet(
-            "QTextEdit{font-family:monospace; font-size:11px; "
-            "background:#f5f5f5; padding:5px; border-radius:4px;}"
-        )
-        layout.addWidget(self.log_output)
-
-        # Keyboard shortcut: Ctrl+Enter
-        shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self)
-        shortcut.activated.connect(self._on_generate)
-
-    # ── Ollama integration ─────────────────────
-
-    def _check_ollama(self):
-        if self.ollama.is_running():
-            self._set_status("✅ Ollama connected", "green")
-            self._refresh_models()
-        else:
-            self._set_status(
-                "❌ Ollama not running — start it: ollama serve", "red"
+    def _toggle(self):
+        if self.server and self.server.running:
+            self.server.stop()
+            self.server = None
+            self.btn.setText("Start Server")
+            self.btn.setStyleSheet(
+                "QPushButton{font-size:13px;font-weight:bold;"
+                "background:#43A047;color:white;border:none;"
+                "border-radius:6px;padding:8px;}"
             )
-            self.generate_btn.setEnabled(False)
-            self.modify_btn.setEnabled(False)
-
-    def _refresh_models(self):
-        models = self.ollama.get_models()
-        current = self.model_combo.currentText()
-        self.model_combo.clear()
-        if models:
-            self.model_combo.addItems(models)
-            idx = self.model_combo.findText(current)
-            if idx >= 0:
-                self.model_combo.setCurrentIndex(idx)
-            self._log(f"Available models: {', '.join(models)}")
-        else:
-            self.model_combo.addItem(OLLAMA_MODEL)
-            self._log("Could not list models, using default.")
-
-    # ── helpers ────────────────────────────────
-
-    def _set_status(self, text, color="black"):
-        palette = {
-            "green": ("#E8F5E9", "#2E7D32"),
-            "red": ("#FFEBEE", "#C62828"),
-            "blue": ("#E3F2FD", "#1565C0"),
-            "orange": ("#FFF3E0", "#E65100"),
-            "black": ("#F5F5F5", "#333333"),
-        }
-        bg, fg = palette.get(color, palette["black"])
-        self.status_label.setText(text)
-        self.status_label.setStyleSheet(
-            "padding:5px 10px; border-radius:4px; font-weight:bold; "
-            f"background-color:{bg}; color:{fg};"
-        )
-
-    def _log(self, message):
-        self.log_output.append(message)
-        sb = self.log_output.verticalScrollBar()
-        sb.setValue(sb.maximum())
-        FreeCAD.Console.PrintMessage(f"[AI-Gen] {message}\n")
-
-    def _ensure_document(self):
-        if FreeCAD.ActiveDocument is None:
-            self._new_document()
-        return FreeCAD.ActiveDocument
-
-    def _new_document(self):
-        self.generation_count += 1
-        name = f"AI_Model_{self.generation_count}"
-        FreeCAD.newDocument(name)
-        self._log(f"📄 New document: {name}")
-        self._set_status(f"📄 New document: {name}", "blue")
-
-    def _clear_history(self):
-        self.ollama.clear_history()
-        self._log("🗑️ History cleared")
-        self._set_status("History cleared", "blue")
-
-    def _display_code(self, code):
-        numbered = []
-        for i, line in enumerate(code.split("\n"), 1):
-            numbered.append(f"{i:4d} │ {line}")
-        self.code_output.setPlainText("\n".join(numbered))
-
-    def _fit_view(self):
-        try:
-            import FreeCADGui
-
-            if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
-                FreeCADGui.ActiveDocument.ActiveView.fitAll()
-        except Exception:
-            pass
-
-    # ── main actions ──────────────────────────
-
-    def _on_generate(self):
-        """Create a NEW model from the prompt."""
-        prompt = self.prompt_input.toPlainText().strip()
-        if not prompt:
-            self._set_status("⚠️ Enter a description first!", "orange")
-            return
-
-        self.ollama.model = self.model_combo.currentText()
-        self._new_document()
-        doc = FreeCAD.ActiveDocument
-
-        self._generate_and_execute(prompt, doc)
-
-    def _on_modify(self):
-        """Add a feature to the EXISTING model."""
-        prompt = self.prompt_input.toPlainText().strip()
-        if not prompt:
-            self._set_status("⚠️ Enter a description first!", "orange")
-            return
-
-        self.ollama.model = self.model_combo.currentText()
-        doc = self._ensure_document()
-
-        enhanced = (
-            "The document already has objects. "
-            "Do NOT recreate existing shapes. Only add:\n" + prompt
-        )
-        self._generate_and_execute(enhanced, doc)
-
-    def _generate_and_execute(self, prompt, doc):
-        """Core: call Ollama, show code, execute, optional auto-fix."""
-        self.generate_btn.setEnabled(False)
-        self.modify_btn.setEnabled(False)
-        self._set_status("🤖 Generating code with Ollama…", "blue")
-        self.code_output.clear()
-        QtWidgets.QApplication.processEvents()
-
-        try:
-            # Generate
-            self._log(f"Prompt: {prompt[:90]}{'…' if len(prompt) > 90 else ''}")
-            code, raw = self.ollama.generate(prompt)
-            self.last_code = code
-            self._display_code(code)
-            self._log(
-                f"Generated: {len(code)} chars, {code.count(chr(10)) + 1} lines"
+            self.status.setText("● Stopped")
+            self.status.setStyleSheet(
+                "padding:6px;border-radius:4px;font-weight:bold;"
+                "background:#FFEBEE;color:#C62828;"
             )
+            self.port_spin.setEnabled(True)
+        else:
+            port = self.port_spin.value()
+            self.server = FreeCADMCPServer(port=port)
+            self.server.start()
+            if self.server.running:
+                self.btn.setText("Stop Server")
+                self.btn.setStyleSheet(
+                    "QPushButton{font-size:13px;font-weight:bold;"
+                    "background:#E53935;color:white;border:none;"
+                    "border-radius:6px;padding:8px;}"
+                )
+                self.status.setText(f"● Listening on port {port}")
+                self.status.setStyleSheet(
+                    "padding:6px;border-radius:4px;font-weight:bold;"
+                    "background:#E8F5E9;color:#2E7D32;"
+                )
+                self.port_spin.setEnabled(False)
 
-            # Execute
-            self._set_status("▶️ Executing code…", "blue")
-            QtWidgets.QApplication.processEvents()
-            ok, message = execute_code(code, doc)
-
-            if ok:
-                self._set_status("🎉 Model created successfully!", "green")
-                self._log(f"✅ {message}")
-                self._fit_view()
-                return
-
-            # If failed, maybe auto-fix
-            self._set_status("❌ Execution error", "red")
-            self._log(f"❌ {message}")
-
-            if self.autofix_check.isChecked():
-                self._log("🔄 Attempting auto-fix with Ollama…")
-                self._set_status("🔄 Auto-fixing code…", "orange")
-                QtWidgets.QApplication.processEvents()
-
-                fixed_code, _ = self.ollama.fix_code(code, message)
-                self.last_code = fixed_code
-                self._display_code(fixed_code)
-
-                ok2, message2 = execute_code(fixed_code, doc)
-                if ok2:
-                    self._set_status("🎉 Auto-fix successful!", "green")
-                    self._log(f"✅ {message2}")
-                    self._fit_view()
-                else:
-                    self._set_status("❌ Auto-fix also failed", "red")
-                    self._log(f"❌ Fix failed: {message2}")
-
-        except URLError as e:
-            self._set_status("❌ Cannot reach Ollama", "red")
-            self._log(f"Connection error: {e}")
-            self._log("Make sure Ollama is running: ollama serve")
-
-        except Exception as e:
-            self._set_status(f"❌ Error: {e}", "red")
-            self._log(traceback.format_exc())
-
-        finally:
-            self.generate_btn.setEnabled(True)
-            self.modify_btn.setEnabled(True)
+    def closeEvent(self, event):
+        if self.server and self.server.running:
+            self.server.stop()
+        super().closeEvent(event)
 
 
 # ═══════════════════════════════════════════════════
-# ENTRY POINT
+# LAUNCH
 # ═══════════════════════════════════════════════════
-
 
 def launch():
-    """Launch the AI Model Generator dialog."""
-    # In FreeCAD, there is usually already a QApplication instance.
     parent = None
-    try:
-        import FreeCADGui
+    if HAS_GUI:
+        try:
+            parent = FreeCADGui.getMainWindow()
+        except Exception:
+            pass
+    panel = FreeCADMCPPanel(parent=parent)
+    panel.show()
+    return panel
 
-        parent = FreeCADGui.getMainWindow()
-    except Exception:
-        parent = None
-
-    dlg = AIModelGeneratorDialog(parent=parent)
-    dlg.show()
-    return dlg
-
-
-_dialog = launch()
+_mcp_panel = launch()
